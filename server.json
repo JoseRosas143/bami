@@ -1,0 +1,184 @@
+const express = require("express");
+const axios = require("axios");
+const fs = require("fs-extra");
+const OpenAI = require("openai");
+require("dotenv").config();
+
+const app = express();
+app.use(express.json());
+
+const PORT = process.env.PORT || 3000;
+const TOKEN = process.env.WHATSAPP_TOKEN;
+const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+
+const usuariosPath = "./usuarios.json";
+
+// 🧠 Enviar mensaje por WhatsApp
+async function enviarMensaje(to, phone_number_id, token, bodyText) {
+  try {
+    await axios.post(
+      `https://graph.facebook.com/v18.0/${phone_number_id}/messages`,
+      {
+        messaging_product: "whatsapp",
+        to,
+        text: { body: bodyText }
+      },
+      {
+        headers: {
+          Authorization: `Bearer ${token}`,
+          "Content-Type": "application/json"
+        }
+      }
+    );
+  } catch (error) {
+    console.error("Error enviando mensaje:", error.response?.data || error);
+  }
+}
+
+// 🤖 Respuesta personalizada con OpenAI
+async function responderConGPT(categoria, mensajeUsuario, historialUsuario = []) {
+  const promptBase = {
+    salud_fisica: "Actúa como un asesor de bienestar físico. Sé amable, profesional y empático.",
+    apoyo_emocional: "Actúa como un guía emocional que ofrece apoyo a personas con ansiedad leve.",
+    nutricion: "Actúa como un nutriólogo que da consejos básicos de alimentación.",
+    contacto_humano: "Actúa como un asistente que canaliza al usuario con un profesional."
+  };
+
+  const sistema = promptBase[categoria] || "Actúa como un asistente de bienestar integral.";
+
+  const mensajes = [
+    { role: "system", content: sistema },
+    ...historialUsuario.slice(-5).map((msg) => ({ role: msg.rol, content: msg.contenido })),
+    { role: "user", content: mensajeUsuario }
+  ];
+
+  try {
+    const respuesta = await openai.chat.completions.create({
+      model: "gpt-4-1106-preview",
+      messages,
+      max_tokens: 300,
+      temperature: 0.7
+    });
+
+    return respuesta.choices[0].message.content.trim();
+  } catch (error) {
+    console.error("Error al comunicarse con OpenAI:", error.message);
+    return "Lo siento, hubo un problema al procesar tu mensaje. ¿Podrías intentar nuevamente?";
+  }
+}
+
+// 📦 Cargar historial del usuario
+function cargarUsuarios() {
+  try {
+    return fs.readJsonSync(usuariosPath);
+  } catch {
+    return {};
+  }
+}
+
+function guardarUsuarios(data) {
+  fs.writeJsonSync(usuariosPath, data, { spaces: 2 });
+}
+
+// 📬 Webhook de WhatsApp
+app.post("/webhook", async (req, res) => {
+  const entry = req.body.entry?.[0];
+  const changes = entry?.changes?.[0];
+  const value = changes?.value;
+  const message = value?.messages?.[0];
+  const phone_number_id = value?.metadata?.phone_number_id;
+
+  if (!message || !message.from) return res.sendStatus(200);
+
+  const from = message.from;
+  const texto = message.text?.body?.trim();
+  const nombrePerfil = value.contacts?.[0]?.profile?.name || "amigo";
+
+  const usuarios = cargarUsuarios();
+
+  // 📍 Crear nuevo usuario si no existe
+  if (!usuarios[from]) {
+    usuarios[from] = {
+      nombre: nombrePerfil,
+      historial: [],
+      estado: "esperando_nombre"
+    };
+    guardarUsuarios(usuarios);
+    await enviarMensaje(from, phone_number_id, TOKEN, `Tu historial ha sido borrado 🧹. ¿Cuál es tu nombre para comenzar de nuevo?`);
+    return res.sendStatus(200);
+  }
+
+  const usuario = usuarios[from];
+
+  // 👤 Capturar nombre
+  if (usuario.estado === "esperando_nombre") {
+    usuario.nombre = texto;
+    usuario.estado = "activo";
+    guardarUsuarios(usuarios);
+    await enviarMensaje(
+      from,
+      phone_number_id,
+      TOKEN,
+      `¡Gracias, ${usuario.nombre}! 🌿 ¿Qué deseas hacer hoy?\n\n1️⃣ Salud física\n2️⃣ Apoyo emocional\n3️⃣ Nutrición\n4️⃣ Hablar con un profesional`
+    );
+    return res.sendStatus(200);
+  }
+
+  // ⌨ Comandos especiales
+  if (texto.toLowerCase() === "reiniciar") {
+    delete usuarios[from];
+    guardarUsuarios(usuarios);
+    await enviarMensaje(from, phone_number_id, TOKEN, `Tu historial ha sido borrado 🧹. ¿Cuál es tu nombre para comenzar de nuevo?`);
+    return res.sendStatus(200);
+  }
+
+  if (texto.toLowerCase() === "mi historial") {
+    const resumen = usuario.historial
+      .slice(-10)
+      .map((m, i) => `${i + 1}. ${m.rol === "user" ? "Tú" : "BAMI"}: ${m.contenido}`)
+      .join("\n");
+    await enviarMensaje(from, phone_number_id, TOKEN, resumen || "Tu historial está vacío.");
+    return res.sendStatus(200);
+  }
+
+  // 💬 Procesar elección o continuar conversación
+  const opciones = {
+    "1": "salud_fisica",
+    "2": "apoyo_emocional",
+    "3": "nutricion",
+    "4": "contacto_humano"
+  };
+
+  if (opciones[texto]) {
+    usuario.contexto = opciones[texto];
+    guardarUsuarios(usuarios);
+    await enviarMensaje(from, phone_number_id, TOKEN, "¡Gracias! ¿En qué puedo ayudarte?");
+    return res.sendStatus(200);
+  }
+
+  const categoria = usuario.contexto || "contacto_humano";
+  usuario.historial.push({ rol: "user", contenido: texto });
+
+  const respuesta = await responderConGPT(categoria, texto, usuario.historial);
+  usuario.historial.push({ rol: "assistant", contenido: respuesta });
+
+  guardarUsuarios(usuarios);
+  await enviarMensaje(from, phone_number_id, TOKEN, respuesta);
+
+  res.sendStatus(200);
+});
+
+// 🌐 Verificación Webhook
+app.get("/webhook", (req, res) => {
+  const VERIFY_TOKEN = process.env.VERIFY_TOKEN;
+  const mode = req.query["hub.mode"];
+  const token = req.query["hub.verify_token"];
+  const challenge = req.query["hub.challenge"];
+
+  if (mode && token && mode === "subscribe" && token === VERIFY_TOKEN) {
+    return res.status(200).send(challenge);
+  }
+  res.sendStatus(403);
+});
+
+app.listen(PORT, () => console.log(`Servidor activo en puerto ${PORT}`));
